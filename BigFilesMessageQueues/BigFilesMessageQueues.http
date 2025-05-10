@@ -1,0 +1,6 @@
+@BigFilesMessageQueues_HostAddress = http://localhost:5215
+
+GET {{BigFilesMessageQueues_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
