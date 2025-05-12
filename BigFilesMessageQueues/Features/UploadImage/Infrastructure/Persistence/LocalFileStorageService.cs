@@ -17,6 +17,9 @@ public class LocalFileStorageService : IFileStorageService
     {
 
         _logger = logger;
+
+        ArgumentNullException.ThrowIfNull(configuration);
+
         _baseStoragePath = configuration["FileUploads:StagingAreaPath"];
 
         if (string.IsNullOrWhiteSpace(_baseStoragePath))

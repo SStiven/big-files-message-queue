@@ -27,7 +27,7 @@ public class Program
             var connectionString = configuration["AzureServiceBus:ConnectionString"];
             if (string.IsNullOrEmpty(connectionString))
             {
-                throw new InvalidOperationException("Azure Service Bus connection string is set");
+                throw new InvalidOperationException("Azure Service Bus connection string is not set");
             }
             return new ServiceBusClient(connectionString);
         });
