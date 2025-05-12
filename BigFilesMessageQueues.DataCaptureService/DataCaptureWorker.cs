@@ -1,5 +1,4 @@
 using System.Text.Json;
-using System.Threading;
 using Azure.Messaging.ServiceBus;
 
 namespace BigFilesMessageQueues.DataCaptureService;
@@ -15,11 +14,11 @@ public class DataCaptureWorker : BackgroundService
     private readonly long _maxFileSizeBeforeChunkingInBytes;
     private readonly long _chunkSizeInBytes;
 
-    private const string SequenceIdProperty = "SequenceId";
+    private const string SequenceProperty = "SequenceId";
     private const string PositionProperty = "Position";
-    private const string IsLastChunkProperty = "IsLastChunk";
     private const string OriginalFileNameProperty = "OriginalFileName";
     private const string ContentTypeProperty = "ContentType";
+    private const string TotalPartsProperty = "Size";
 
     public DataCaptureWorker(
         ILogger<DataCaptureWorker> logger,
@@ -133,9 +132,37 @@ public class DataCaptureWorker : BackgroundService
                 return;
             }
 
-            var fileInfo = new FileInfo(fullPath);
+            var fileAsBytes = await File.ReadAllBytesAsync(fullPath, args.CancellationToken);
+            var fileLength = fileAsBytes.LongLength;
 
-            await SendFileMessageAsync(notification, fullPath, fileInfo.Length, args.CancellationToken);
+            var numParts = fileLength <= _maxFileSizeBeforeChunkingInBytes ? 1 : (int)Math.Ceiling((double)fileLength / _chunkSizeInBytes);
+            var remaining = fileLength;
+
+            for (int i = 0; i < numParts; i++)
+            {
+                var numBytesToSend = Math.Min(remaining, _chunkSizeInBytes);
+
+                var chunk = new byte[numBytesToSend];
+                var offset = i * _chunkSizeInBytes;
+                Array.Copy(fileAsBytes, offset, chunk, 0, numBytesToSend);
+
+                var msg = new ServiceBusMessage(chunk)
+                {
+                    MessageId = $"{notification.FileId}-{i}",
+                    ContentType = notification.ContentType,
+                };
+
+                msg.ApplicationProperties[SequenceProperty] = notification.FileId;
+                msg.ApplicationProperties[PositionProperty] = i;
+                msg.ApplicationProperties[TotalPartsProperty] = numParts;
+                msg.ApplicationProperties[OriginalFileNameProperty] = notification.OriginalFileName;
+                msg.ApplicationProperties[ContentTypeProperty] = notification.ContentType;
+
+                await _processingQueueSender.SendMessageAsync(msg, args.CancellationToken);
+                _logger.LogInformation("Sent part {Part}/{Total} for FileId {Id}", numParts, i, notification.FileId);
+
+                remaining -= numBytesToSend;
+            }
 
             await args.CompleteMessageAsync(args.Message, args.CancellationToken);
             _logger.LogInformation("Successfully processed and completed notification for FileId: {FileId}", notification.FileId);
@@ -153,26 +180,5 @@ public class DataCaptureWorker : BackgroundService
         }
 
         _logger.LogInformation($"MessageHandlerAsync: {body}");
-    }
-
-    private async Task SendFileMessageAsync(FileUploadNotification notification, string fullPath, long fileLengthInBytes, CancellationToken cancellationToken)
-    {
-        _logger.LogInformation($"File is smaller than chunking threshold: {_maxFileSizeBeforeChunkingInBytes} Bytes. Sending as single message.", notification.StagedFilePath);
-
-        byte[] fileContent = await File.ReadAllBytesAsync(fullPath, cancellationToken);
-        var message = new ServiceBusMessage(fileContent);
-
-        message.ApplicationProperties[SequenceIdProperty] = notification.FileId;
-        message.ApplicationProperties[PositionProperty] = 1;
-        message.ApplicationProperties[IsLastChunkProperty] = true;
-
-        message.ApplicationProperties[OriginalFileNameProperty] = notification.OriginalFileName;
-        message.ApplicationProperties[ContentTypeProperty] = notification.ContentType;
-
-        message.MessageId = $"{notification.FileId}-1";
-        message.ContentType = notification.ContentType;
-
-        await _processingQueueSender.SendMessageAsync(message, cancellationToken);
-        _logger.LogInformation("Sent single message for FileId: {FileId} to queue '{QueueName}'", notification.FileId, _processingQueueName);
     }
 }

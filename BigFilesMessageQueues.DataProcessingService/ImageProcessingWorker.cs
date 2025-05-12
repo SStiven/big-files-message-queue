@@ -10,11 +10,10 @@ public class ImageProcessingWorker : BackgroundService
     private readonly string _inputQueueName;
     private readonly string _processedFilesPath;
 
-    private const string SequenceIdProperty = "SequenceId";
+    private const string SequenceProperty = "SequenceId";
     private const string PositionProperty = "Position";
-    private const string IsLastChunkProperty = "IsLastChunk";
     private const string OriginalFileNameProperty = "OriginalFileName";
-    private const string ContentTypeProperty = "ContentType";
+    private const string TotalPartsProperty = "Size";
 
 
     public ImageProcessingWorker(
@@ -66,24 +65,24 @@ public class ImageProcessingWorker : BackgroundService
         var message = args.Message;
         string messageId = message.MessageId ?? "N/A";
 
-        if (!message.ApplicationProperties.TryGetValue(SequenceIdProperty, out object? seqIdObj) || seqIdObj is not string sequenceId || string.IsNullOrEmpty(sequenceId))
+        if (!message.ApplicationProperties.TryGetValue(SequenceProperty, out object? seqIdObj) || seqIdObj is not string sequenceId || string.IsNullOrEmpty(sequenceId))
         {
             _logger.LogWarning("Message {MessageId} is missing SequenceId or it's not a string. Dead-lettering.", messageId);
             await args.DeadLetterMessageAsync(message, "MissingSequenceId", "SequenceId property is missing or invalid.", args.CancellationToken);
             return;
         }
 
-        if (!message.ApplicationProperties.TryGetValue(PositionProperty, out object? posObj) || posObj is not int position || position <= 0)
+        if (!message.ApplicationProperties.TryGetValue(PositionProperty, out object? posObj) || posObj is not int position || position < 0)
         {
             _logger.LogWarning("Message {MessageId} for SequenceId {SequenceId} is missing Position or it's invalid. Dead-lettering.", messageId, sequenceId);
             await args.DeadLetterMessageAsync(message, "MissingPosition", "Position property is missing or invalid.", args.CancellationToken);
             return;
         }
 
-        if (!message.ApplicationProperties.TryGetValue(IsLastChunkProperty, out object? lastObj) || lastObj is not bool isLastChunk)
+        if (!message.ApplicationProperties.TryGetValue(TotalPartsProperty, out object? totalPartsObj) || totalPartsObj is not int)
         {
-            _logger.LogWarning("Message {MessageId} for SequenceId {SequenceId} is missing IsLastChunk or it's invalid. Dead-lettering.", messageId, sequenceId);
-            await args.DeadLetterMessageAsync(message, "MissingIsLastChunk", "IsLastChunk property is missing or invalid.", args.CancellationToken);
+            _logger.LogWarning("Message {MessageId} for SequenceId {SequenceId} is missing TotalPartsProperty or it's invalid. Dead-lettering.", messageId, sequenceId);
+            await args.DeadLetterMessageAsync(message, "MissingTotalPartsProperty", "TotalPartsProperty property is missing or invalid.", args.CancellationToken);
             return;
         }
 
