@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Azure.Messaging.ServiceBus;
 
 namespace BigFilesMessageQueues.DataProcessingService;
@@ -15,6 +16,7 @@ public class ImageProcessingWorker : BackgroundService
     private const string OriginalFileNameProperty = "OriginalFileName";
     private const string TotalPartsProperty = "Size";
 
+    private readonly ConcurrentDictionary<string, PendingMessage> _pending = new();
 
     public ImageProcessingWorker(
         ILogger<ImageProcessingWorker> logger,
@@ -79,21 +81,68 @@ public class ImageProcessingWorker : BackgroundService
             return;
         }
 
-        if (!message.ApplicationProperties.TryGetValue(TotalPartsProperty, out object? totalPartsObj) || totalPartsObj is not int)
+        if (!message.ApplicationProperties.TryGetValue(TotalPartsProperty, out object? totalPartsObj) || totalPartsObj is not int currentChunkTotalParts)
         {
             _logger.LogWarning("Message {MessageId} for SequenceId {SequenceId} is missing TotalPartsProperty or it's invalid. Dead-lettering.", messageId, sequenceId);
             await args.DeadLetterMessageAsync(message, "MissingTotalPartsProperty", "TotalPartsProperty property is missing or invalid.", args.CancellationToken);
             return;
         }
 
-        message.ApplicationProperties.TryGetValue(OriginalFileNameProperty, out object? originalImageName);
+        if (!message.ApplicationProperties.TryGetValue(OriginalFileNameProperty, out object? originalNameObj) || originalNameObj is not string originalName || string.IsNullOrEmpty(originalName))
+        {
+            _logger.LogWarning("Message {MessageId} for SequenceId {SequenceId} is missing OriginalFileNameProperty or it's invalid. Dead-lettering.", messageId, sequenceId);
+            await args.DeadLetterMessageAsync(message, "MissingOriginalFileName", "OriginalFileName property is missing or invalid.", args.CancellationToken);
+            return;
+        }
 
-        byte[] fileBytes = message.Body.ToArray();
-        var originalFileName = originalImageName as string ?? $"{sequenceId}.bin";
-        var outputPath = Path.Combine(_processedFilesPath, originalFileName);
-        await File.WriteAllBytesAsync(outputPath, fileBytes, args.CancellationToken);
-        _logger.LogInformation("Saved image {File} ({Size} bytes) to {Path}", originalFileName, fileBytes.Length, outputPath);
+        var chunk = message.Body.ToArray();
+
+        var pending = _pending.GetOrAdd(sequenceId, id => new PendingMessage
+        {
+            OriginalFileName = originalName,
+            ExpectedParts = currentChunkTotalParts
+        });
+
+        if (pending.ExpectedParts != currentChunkTotalParts)
+        {
+            _logger.LogWarning("Sequence {Seq} size mismatch: expected {Expected}, got {Actual}", sequenceId, pending.ExpectedParts, currentChunkTotalParts);
+            _pending.TryRemove(sequenceId, out _);
+            await args.DeadLetterMessageAsync(message, "SizeMismatch", null, args.CancellationToken);
+            return;
+        }
+
+        if (pending.Chunks.TryAdd(position, chunk))
+        {
+            _logger.LogDebug("Buffered part {Pos}/{Total} for {Seq}", position, currentChunkTotalParts, sequenceId);
+        }
+        else
+        {
+            _logger.LogDebug("Duplicate part {Pos} for {Seq} ignored", position, sequenceId);
+        }
+
         await args.CompleteMessageAsync(message, args.CancellationToken);
+
+        if (pending.Chunks.Count == pending.ExpectedParts)
+        {
+            await JoinChunksAndSaveAsync(sequenceId, pending);
+            _pending.TryRemove(sequenceId, out _);
+        }
+    }
+
+    private async Task JoinChunksAndSaveAsync(string sequenceId, PendingMessage pendingMessage)
+    {
+        var outputPath = Path.Combine(_processedFilesPath, pendingMessage.OriginalFileName!);
+        _logger.LogInformation("Reassembling {Count} parts for Sequence {Seq} into {Path}",
+            pendingMessage.Chunks.Count, sequenceId, outputPath);
+
+        using var fs = File.Create(outputPath);
+        foreach (var kv in pendingMessage.Chunks.OrderBy(k => k.Key))
+        {
+            await fs.WriteAsync(kv.Value, 0, kv.Value.Length);
+        }
+        await fs.FlushAsync();
+
+        _logger.LogInformation("Sequence {Seq} written to {File}", sequenceId, pendingMessage.OriginalFileName);
     }
 
     private void CreateDirectoryExists(string? path)
