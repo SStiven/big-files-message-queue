@@ -6,6 +6,7 @@ namespace BigFilesMessageQueues.DataProcessingService;
 public class ImageProcessingWorker : BackgroundService
 {
     private readonly ILogger<ImageProcessingWorker> _logger;
+    private readonly IFileStorageService _fileStorageService;
     private readonly ServiceBusClient _serviceBusClient;
     private readonly ServiceBusProcessor _processor;
     private readonly string _inputQueueName;
@@ -21,20 +22,24 @@ public class ImageProcessingWorker : BackgroundService
     public ImageProcessingWorker(
         ILogger<ImageProcessingWorker> logger,
         IConfiguration configuration,
-        ServiceBusClient serviceBusClient)
+        ServiceBusClient serviceBusClient,
+        IFileStorageService fileStorageService)
     {
         ArgumentNullException.ThrowIfNull(logger);
-        ArgumentNullException.ThrowIfNull(configuration);
-        ArgumentNullException.ThrowIfNull(serviceBusClient);
-
         _logger = logger;
-        _serviceBusClient = serviceBusClient;
 
+        ArgumentNullException.ThrowIfNull(configuration);
         _inputQueueName = configuration["AzureServiceBus:ImageProcessingQueueName"];
         if (string.IsNullOrWhiteSpace(_inputQueueName))
         {
             throw new InvalidOperationException("AzureServiceBus:ImageProcessingQueueName shouldn't be null or empty");
         }
+
+        ArgumentNullException.ThrowIfNull(serviceBusClient);
+        _serviceBusClient = serviceBusClient;
+
+        ArgumentNullException.ThrowIfNull(fileStorageService);
+        _fileStorageService = fileStorageService;
 
         _processedFilesPath = configuration["FileProcessing:ProcessedFilesPath"];
         if (string.IsNullOrWhiteSpace(_processedFilesPath))
@@ -42,7 +47,7 @@ public class ImageProcessingWorker : BackgroundService
             throw new InvalidOperationException("FileProcessing:ProcessedFilesPath shouldn't be null or empty");
         }
 
-        CreateDirectoryExists(_processedFilesPath);
+        _fileStorageService.CreateDirectoryIfNotExists(_processedFilesPath);
 
         var options = new ServiceBusProcessorOptions
         {
@@ -53,7 +58,7 @@ public class ImageProcessingWorker : BackgroundService
         _processor = _serviceBusClient.CreateProcessor(_inputQueueName, options);
         _processor.ProcessMessageAsync += MessageHandlerAsync;
         _processor.ProcessErrorAsync += ErrorHandlerAsync;
-
+        _fileStorageService = fileStorageService;
     }
 
     private Task ErrorHandlerAsync(ProcessErrorEventArgs args)
@@ -135,31 +140,12 @@ public class ImageProcessingWorker : BackgroundService
         _logger.LogInformation("Reassembling {Count} parts for Sequence {Seq} into {Path}",
             pendingMessage.Chunks.Count, sequenceId, outputPath);
 
-        using var fs = File.Create(outputPath);
-        foreach (var kv in pendingMessage.Chunks.OrderBy(k => k.Key))
-        {
-            await fs.WriteAsync(kv.Value, 0, kv.Value.Length);
-        }
-        await fs.FlushAsync();
+        var orderedChunks = pendingMessage.Chunks
+            .OrderBy(kv => kv.Key)
+            .Select(kv => kv.Value);
 
+        await _fileStorageService.SaveFileAsync(outputPath, orderedChunks);
         _logger.LogInformation("Sequence {Seq} written to {File}", sequenceId, pendingMessage.OriginalFileName);
-    }
-
-    private void CreateDirectoryExists(string? path)
-    {
-        try
-        {
-            if (!Directory.Exists(path))
-            {
-                Directory.CreateDirectory(path);
-                _logger.LogInformation("Created directory: {Path}", path);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogCritical(ex, "Failed to ensure directory exists: {Path}. Service cannot save processed files.", path);
-            throw;
-        }
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -180,6 +166,5 @@ public class ImageProcessingWorker : BackgroundService
         _logger.LogInformation("Stopping file processing message processor...");
         await _processor.StopProcessingAsync(CancellationToken.None);
         _logger.LogInformation("File processing message processor stopped.");
-
     }
 }
